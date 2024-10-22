@@ -1,4 +1,7 @@
-# Ruta al archivo de configuración
+# Este script revisa las conexiones TCP y UDP activas, obtiene la información del proceso asociado,
+# verifica el hash del archivo ejecutable del proceso en VirusTotal y genera reportes de posibles amenazas.
+
+# Ruta al archivo de configuración que contiene la clave API de VirusTotal
 $configFilePath = ".\config.json"
 
 # Verificar si el archivo de configuración existe
@@ -7,7 +10,7 @@ if (-Not (Test-Path $configFilePath)) {
     exit
 }
 
-# Leer el archivo de configuración
+# Leer el archivo de configuración y obtener la clave API
 try {
     $configContent = Get-Content -Path $configFilePath -Raw | ConvertFrom-Json
 } catch {
@@ -15,16 +18,16 @@ try {
     exit
 }
 
-# Obtener la clave API de VirusTotal desde el archivo de configuración
+# Obtener la clave API de VirusTotal
 $VirusTotalApiKey = $configContent.VirusTotalApiKey
 
-# Verificar si la clave API está presente
+# Verificar si la clave API está definida en el archivo de configuración
 if (-Not $VirusTotalApiKey) {
     Write-Error "La clave API de VirusTotal no está definida en el archivo de configuración."
     exit
 }
 
-# Función para convertir un PSCustomObject a Hashtable
+# Función para convertir un PSCustomObject a un Hashtable
 function ConvertTo-Hashtable {
     param (
         [Parameter(Mandatory = $true)]
@@ -38,16 +41,14 @@ function ConvertTo-Hashtable {
     return $hashtable
 }
 
-# Ruta al archivo de caché
+# Ruta al archivo de caché para almacenar resultados previos
 $cacheFilePath = ".\vt_cache.json"
 
-# Cargar la caché desde el disco
+# Cargar la caché si existe, o crear una nueva si no
 if (Test-Path $cacheFilePath) {
     try {
         $cacheJson = Get-Content -Path $cacheFilePath -Raw
         $cacheDataObj = $cacheJson | ConvertFrom-Json
-
-        # Convertir el objeto en un Hashtable
         $cacheData = ConvertTo-Hashtable -Object $cacheDataObj
     } catch {
         Write-Warning "No se pudo leer o parsear el archivo de caché. Se creará uno nuevo."
@@ -57,11 +58,11 @@ if (Test-Path $cacheFilePath) {
     $cacheData = @{}
 }
 
-# Inicializar variables para el control de la tasa de solicitudes
+# Inicializar variables para controlar el límite de solicitudes a la API de VirusTotal
 $apiCallCount = 0
 $apiCallStartTime = Get-Date
 
-# Función para controlar la tasa de solicitudes
+# Función para controlar la tasa de solicitudes (4 por minuto)
 function Control-RateLimit {
     param (
         [int]$CallCount,
@@ -71,16 +72,16 @@ function Control-RateLimit {
     if ($CallCount -ge 4) {
         if ($elapsedTime.TotalSeconds -lt 60) {
             $sleepTime = [int](60 - $elapsedTime.TotalSeconds)
-            Write-Host "Se alcanzó el límite de 4 solicitudes por minuto. Pausando por $sleepTime segundos para respetar la tasa de la API..."
+            Write-Host "Límite alcanzado: Pausando por $sleepTime segundos para respetar la tasa de la API..."
             Start-Sleep -Seconds $sleepTime
         }
-        # Reiniciar el contador y el tiempo de inicio
+        # Reiniciar el contador de llamadas
         $script:apiCallCount = 0
         $script:apiCallStartTime = Get-Date
     }
 }
 
-# Función para consultar VirusTotal
+# Función para verificar un archivo en VirusTotal usando su hash SHA256
 function Check-VirusTotal {
     param (
         [string]$FilePath
@@ -90,7 +91,7 @@ function Check-VirusTotal {
         return "Archivo no encontrado"
     }
 
-    # Obtener el hash SHA256 del archivo
+    # Calcular el hash SHA256 del archivo
     $sha256 = (Get-FileHash -Algorithm SHA256 -Path $FilePath).Hash
 
     # Verificar si el hash ya está en la caché
@@ -98,13 +99,13 @@ function Check-VirusTotal {
         return $cacheData[$sha256]
     }
 
-    # Controlar la tasa de solicitudes
+    # Controlar la tasa de solicitudes a la API
     Control-RateLimit -CallCount $apiCallCount -StartTime $apiCallStartTime
 
-    # Construir la URL de la API
+    # URL de la API de VirusTotal
     $url = "https://www.virustotal.com/api/v3/files/$sha256"
 
-    # Configurar el encabezado con la clave de API
+    # Encabezados con la clave API
     $headers = @{
         "x-apikey" = $VirusTotalApiKey
     }
@@ -112,11 +113,9 @@ function Check-VirusTotal {
     # Realizar la solicitud a la API
     try {
         $response = Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
-
-        # Incrementar el contador de llamadas a la API
         $script:apiCallCount++
 
-        # Analizar la respuesta
+        # Analizar el resultado de VirusTotal
         $maliciousCount = $response.data.attributes.last_analysis_stats.malicious
         $suspiciousCount = $response.data.attributes.last_analysis_stats.suspicious
 
@@ -132,60 +131,49 @@ function Check-VirusTotal {
     # Guardar el resultado en la caché
     $cacheData[$sha256] = $vtResult
 
-    # Devolver el resultado
     return $vtResult
 }
 
-# Obtener todas las conexiones TCP y UDP
+# Obtener todas las conexiones TCP y UDP activas
 $netConnections = Get-NetTCPConnection -ErrorAction SilentlyContinue
 $netConnections += Get-NetUDPEndpoint -ErrorAction SilentlyContinue
 
-# Crear una lista para almacenar los resultados
+# Listas para almacenar los resultados y reportes
 $resultList = @()
-
-# Listas para los reportes
 $maliciousProcesses = @()
 $unknownProcesses = @()
 
-# Recorrer cada conexión y obtener el nombre del proceso y la ruta
+# Recorrer cada conexión y verificar el proceso asociado en VirusTotal
 foreach ($conn in $netConnections) {
-    # Obtener el proceso basado en el PID (OwningProcess)
     $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($conn.OwningProcess)" -ErrorAction SilentlyContinue
 
-    # Obtener el nombre del proceso y la ruta
     $processName = $process.Name
     $processPath = $process.ExecutablePath
 
-    # Si no se puede obtener el nombre del proceso, asignar "Desconocido"
-    if (!$processName) {
-        $processName = "Desconocido"
-    }
-
-    # Si no se puede obtener la ruta del proceso, asignar "Desconocido"
-    if (!$processPath) {
+    if (!$processName) { $processName = "Desconocido" }
+    if (!$processPath) { 
         $processPath = "Desconocido"
         $vtResult = "No se pudo verificar"
     } else {
-        # Consultar VirusTotal
         $vtResult = Check-VirusTotal -FilePath $processPath
     }
 
-    # Crear un objeto con la información recopilada
+    # Crear un objeto con los detalles de la conexión
     $obj = [PSCustomObject]@{
-        'Protocolo'       = $conn.GetType().Name -match 'TCP' ? 'TCP' : 'UDP'
-        'Dirección Local' = "$($conn.LocalAddress):$($conn.LocalPort)"
+        'Protocolo'        = $conn.GetType().Name -match 'TCP' ? 'TCP' : 'UDP'
+        'Dirección Local'  = "$($conn.LocalAddress):$($conn.LocalPort)"
         'Dirección Remota' = if ($conn.RemoteAddress -and $conn.RemotePort) { "$($conn.RemoteAddress):$($conn.RemotePort)" } else { 'N/A' }
-        'Estado'          = if ($conn.State) { $conn.State } else { 'N/A' }
-        'Proceso'         = $processName
-        'ProcesoID'       = $conn.OwningProcess
-        'Ruta'            = $processPath
-        'VirusTotal'      = $vtResult
+        'Estado'           = if ($conn.State) { $conn.State } else { 'N/A' }
+        'Proceso'          = $processName
+        'ProcesoID'        = $conn.OwningProcess
+        'Ruta'             = $processPath
+        'VirusTotal'       = $vtResult
     }
 
-    # Agregar el objeto a la lista de resultados
+    # Agregar a la lista de resultados
     $resultList += $obj
 
-    # Agregar a las listas de reportes si corresponde
+    # Agregar a los reportes si corresponde
     if ($vtResult -like "Posible amenaza detectada*") {
         $maliciousProcesses += $obj
     } elseif ($vtResult -eq "No hay información en VirusTotal") {
@@ -193,67 +181,46 @@ foreach ($conn in $netConnections) {
     }
 }
 
-# Guardar la caché actualizada en disco
+# Guardar la caché actualizada en el disco
 try {
     $cacheData | ConvertTo-Json | Set-Content -Path $cacheFilePath -Encoding UTF8
 } catch {
     Write-Warning "No se pudo guardar la caché en disco."
 }
 
-# Agrupar los resultados por Proceso, ProcesoID, Ruta y VirusTotal
+# Mostrar los resultados agrupados por proceso
 $groupedResults = $resultList | Group-Object -Property Proceso, ProcesoID, Ruta, VirusTotal
-
-# Mostrar los resultados
 foreach ($group in $groupedResults) {
-    $processName = $group.Group[0].Proceso
-    $processId = $group.Group[0].ProcesoID
-    $processPath = $group.Group[0].Ruta
-    $vtStatus = $group.Group[0].VirusTotal
-
-    Write-Host "Proceso: $processName (PID: $processId)"
-    Write-Host "Ruta: $processPath"
-    Write-Host "Estado en VirusTotal: $vtStatus"
+    Write-Host "Proceso: $($group.Group[0].Proceso) (PID: $($group.Group[0].ProcesoID))"
+    Write-Host "Ruta: $($group.Group[0].Ruta)"
+    Write-Host "Estado en VirusTotal: $($group.Group[0].VirusTotal)"
     Write-Host "Puertos:"
-
     foreach ($item in $group.Group) {
         Write-Host "`tProtocolo: $($item.Protocolo), Dirección Local: $($item.'Dirección Local'), Dirección Remota: $($item.'Dirección Remota'), Estado: $($item.Estado)"
     }
-
     Write-Host "---------------------------------------------------------"
 }
 
-# Generar el reporte de procesos maliciosos
+# Generar reportes de procesos maliciosos
 if ($maliciousProcesses.Count -gt 0) {
     Write-Host "`n**** Reporte de Procesos Maliciosos Detectados ****`n" -ForegroundColor Red
-    $maliciousGrouped = $maliciousProcesses | Group-Object -Property Proceso, ProcesoID, Ruta, VirusTotal
-    foreach ($group in $maliciousGrouped) {
-        $processName = $group.Group[0].Proceso
-        $processId = $group.Group[0].ProcesoID
-        $processPath = $group.Group[0].Ruta
-        $vtStatus = $group.Group[0].VirusTotal
-
-        Write-Host "Proceso: $processName (PID: $processId)"
-        Write-Host "Ruta: $processPath"
-        Write-Host "Estado en VirusTotal: $vtStatus"
+    foreach ($group in ($maliciousProcesses | Group-Object -Property Proceso, ProcesoID, Ruta, VirusTotal)) {
+        Write-Host "Proceso: $($group.Group[0].Proceso) (PID: $($group.Group[0].ProcesoID))"
+        Write-Host "Ruta: $($group.Group[0].Ruta)"
+        Write-Host "Estado en VirusTotal: $($group.Group[0].VirusTotal)"
         Write-Host "---------------------------------------------------------"
     }
 } else {
     Write-Host "`nNo se detectaron procesos maliciosos según VirusTotal.`n"
 }
 
-# Generar el reporte de procesos desconocidos
+# Generar reportes de procesos desconocidos
 if ($unknownProcesses.Count -gt 0) {
     Write-Host "`n**** Reporte de Procesos Desconocidos en VirusTotal ****`n" -ForegroundColor Yellow
-    $unknownGrouped = $unknownProcesses | Group-Object -Property Proceso, ProcesoID, Ruta, VirusTotal
-    foreach ($group in $unknownGrouped) {
-        $processName = $group.Group[0].Proceso
-        $processId = $group.Group[0].ProcesoID
-        $processPath = $group.Group[0].Ruta
-        $vtStatus = $group.Group[0].VirusTotal
-
-        Write-Host "Proceso: $processName (PID: $processId)"
-        Write-Host "Ruta: $processPath"
-        Write-Host "Estado en VirusTotal: $vtStatus"
+    foreach ($group in ($unknownProcesses | Group-Object -Property Proceso, ProcesoID, Ruta, VirusTotal)) {
+        Write-Host "Proceso: $($group.Group[0].Proceso) (PID: $($group.Group[0].ProcesoID))"
+        Write-Host "Ruta: $($group.Group[0].Ruta)"
+        Write-Host "Estado en VirusTotal: $($group.Group[0].VirusTotal)"
         Write-Host "---------------------------------------------------------"
     }
 } else {
